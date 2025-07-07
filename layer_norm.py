@@ -1,10 +1,12 @@
 import numpy as np
-
+from numba import njit
+from numba import prange
+import time
 # import line_profiler as lp
 # import memory_profiler as mp
 
 
-@profile
+
 def embed_tokens(token_ids, token_embedding, positional_embedding):
     """Embed tokens using token and positional embeddings.
     Args:
@@ -18,25 +20,35 @@ def embed_tokens(token_ids, token_embedding, positional_embedding):
     return embedded_tokens + positional_embedding[np.newaxis, :, :]
 
 
-@profile
-def layer_norm(input_tensor, gamma_weights, beta_weights, eps=1e-5):
-    """Layer normalization function.
-    Args:
-        x: Input tensor of shape (batch, features).
-        gamma: Scale parameter of shape (features,).
-        beta: Shift parameter of shape (features,).
-        eps: Small constant for numerical stability.
-    Returns:
-        Normalized tensor of the same shape as x.
-    """
-    mean = np.mean(input_tensor, axis=-1, keepdims=True)
-    var = np.var(input_tensor, axis=-1, keepdims=True)
-    # Eps prevents division by zero
-    norm = (input_tensor - mean) / np.sqrt(var + eps)
-    return norm * gamma_weights + beta_weights
+
+@njit(parallel=True)
+def layer_norm(input_tensor, gamma, beta, eps=1e-5):
+    batch_size, seq_len, hidden_dim = input_tensor.shape
+    output = np.empty_like(input_tensor)
+
+    for b in prange(batch_size):
+        for s in range(seq_len):
+            mean = 0.0
+            var = 0.0
+            # Mean
+            for h in range(hidden_dim):
+                mean += input_tensor[b, s, h]
+            mean /= hidden_dim
+
+            # Variance
+            for h in range(hidden_dim):
+                var += (input_tensor[b, s, h] - mean) ** 2
+            var /= hidden_dim
+
+            # Normalize
+            for h in range(hidden_dim):
+                norm = (input_tensor[b, s, h] - mean) / np.sqrt(var + eps)
+                output[b, s, h] = norm * gamma[h] + beta[h]
+
+    return output
 
 
-@profile
+
 def relu(input_tensor):
     """Rectified Linear Unit activation function.
     Args:
@@ -47,8 +59,9 @@ def relu(input_tensor):
     return np.maximum(0, input_tensor)
 
 
-@profile
-def softmax(input_tensor, axis=-1):
+
+@njit(parallel=True)
+def softmax_4d(input_tensor, max, axis=-1):
     """Softmax function.
     Args:
         input_tensor: Input tensor.
@@ -56,14 +69,37 @@ def softmax(input_tensor, axis=-1):
     Returns:
         Output tensor with softmax applied.
     """
-    input_tensor = input_tensor - np.max(
-        input_tensor, axis=axis, keepdims=True
-    )  # prevent overflow
-    exp = np.exp(input_tensor)
-    return exp / np.sum(exp, axis=axis, keepdims=True)
+    shape = input_tensor.shape
+    output = np.empty_like(input_tensor)
+    for b in prange(shape[0]):  # batch size
+        for h in range(shape[1]):  # num_heads
+            for i in range(shape[2]):  # query position (seq_len)
+                row = input_tensor[b, h, i, :]
+                max_val = np.max(row)
+                exp_row = np.exp(row - max_val)
+                sum_exp = np.sum(exp_row)
+                output[b, h, i, :] = exp_row / sum_exp
+    return output
 
 
-@profile
+@njit(parallel=True)
+def softmax_3d(input_tensor):
+    """Softmax for (batch, seq, vocab) shaped tensor."""
+    batch, seq, vocab = input_tensor.shape
+    output = np.empty_like(input_tensor)
+
+    for b in prange(batch):
+        for s in range(seq):
+            # Extract row
+            row = input_tensor[b, s, :]
+            max_val = np.max(row)
+            exp_row = np.exp(row - max_val)
+            sum_exp = np.sum(exp_row)
+            output[b, s, :] = exp_row / sum_exp
+
+    return output
+
+
 def reshape_for_heads(input_tensor, batch_size, sequence_length, heads, dims_per_head):
     """Reshape input tensor for multi-head attention.
     Args:
@@ -84,7 +120,7 @@ def reshape_for_heads(input_tensor, batch_size, sequence_length, heads, dims_per
     ).transpose(0, 2, 1, 3)
 
 
-@profile
+
 def causal_mask(size):
     """Create a causal mask for self-attention.
     Args:
@@ -111,7 +147,7 @@ def dropout(input_tensor, dropout_rate):
     return input_tensor * mask / (1 - dropout_rate)
 
 
-@profile
+
 def self_attention_block(
     input_tensor,
     query_weights,
@@ -157,7 +193,8 @@ def self_attention_block(
     # [:, None, :, :] reshapes the mask to align with the scores tensor, extends in the batch_size dimension
     scores = np.where(mask[:, None, :, :], scores, -1e9)
 
-    weights = softmax(scores, axis=-1)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    weights = softmax_4d(scores, max_scores, axis=-1)
 
     attended = weights @ value
     attended = attended.transpose(0, 2, 1, 3).reshape(
@@ -166,7 +203,8 @@ def self_attention_block(
     return attended
 
 
-@profile
+
+@njit(parallel=True)
 def mlp_block(input_tensor, mlp_weights1, mlp_bias1, mlp_weights2, mlp_bias2):
     """Feedforward MLP block.
     Args:
@@ -178,19 +216,54 @@ def mlp_block(input_tensor, mlp_weights1, mlp_bias1, mlp_weights2, mlp_bias2):
     Returns:
         Output tensor after MLP.
     """
-    hidden = relu(input_tensor @ mlp_weights1.T + mlp_bias1)
-    return hidden @ mlp_weights2.T + mlp_bias2
+    batch_size, seq_len, hidden_dim = input_tensor.shape
+    mlp_dim = mlp_weights1.shape[0]
+
+    # First linear layer + bias
+    hidden = np.empty((batch_size, seq_len, mlp_dim))
+    for b in prange(batch_size):
+        for s in range(seq_len):
+            for i in range(mlp_dim):
+                val = 0.0
+                for j in range(hidden_dim):
+                    val += input_tensor[b, s, j] * mlp_weights1[i, j]
+                hidden[b, s, i] = np.maximum(0, val + mlp_bias1[i])
+
+    # Second linear layer + bias
+    output = np.empty((batch_size, seq_len, hidden_dim))
+    for b in prange(batch_size):
+        for s in range(seq_len):
+            for i in range(hidden_dim):
+                val = 0.0
+                for j in range(mlp_dim):
+                    val += hidden[b, s, j] * mlp_weights2[i, j]
+                output[b, s, i] = val + mlp_bias2[i]
+
+    return output
 
 
-@profile
+
+@njit(parallel=True)
 def final_logits(output_tensor, head_weights, gamma_weights, beta_weights):
-    """Project output to vocabulary logits after layer norm.
-    output_tensor: (batch, seq, hidden)
-    head_weights: (vocab_size, hidden)
-    Returns: (batch, seq, vocab_size)
-    """
+    batch_size, seq_len, hidden_dim = output_tensor.shape
+    vocab_size = head_weights.shape[0]
+
+    # Apply layer norm
     normed_tensor = layer_norm(output_tensor, gamma_weights, beta_weights)
-    return normed_tensor @ head_weights.T
+
+    # Prepare output logits
+    logits = np.empty((batch_size, seq_len, vocab_size))
+
+    # Compute logits = normed_tensor @ head_weights.T
+    for b in prange(batch_size):
+        for s in range(seq_len):
+            for v in range(vocab_size):
+                val = 0.0
+                for h in range(hidden_dim):
+                    val += normed_tensor[b, s, h] * head_weights[v, h]
+                logits[b, s, v] = val
+
+    return logits
 
 
 def full_block(
@@ -287,7 +360,8 @@ def full_block(
     logits = final_logits(
         second_input_residual, token_embedding, gamma_weights3, beta_weights3
     )
-    return softmax(logits, axis=-1)
+
+    return softmax_3d(logits)
 
 
 if __name__ == "__main__":
@@ -361,6 +435,7 @@ if __name__ == "__main__":
 
     mask = causal_mask(sequence_length)[None, :, :].repeat(batch_size, axis=0)
 
+    start = time.time()
     full_block_output = full_block(
         token_ids,
         token_embedding,
@@ -387,5 +462,7 @@ if __name__ == "__main__":
         mask,
         dropout_rate
     )
+    end = time.time()
+    print(f"Execution time: {end - start:.6f} seconds")
 
     print("Tranformer pass completed")
