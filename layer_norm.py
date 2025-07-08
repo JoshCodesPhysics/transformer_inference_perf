@@ -94,23 +94,6 @@ def causal_mask(size):
     """
     return np.tril(np.ones((size, size), dtype=bool))
 
-
-def dropout(input_tensor, dropout_rate):
-    """Apply dropout to input tensor.
-    Args:
-        input_tensor: Input tensor of shape (batch_size, sequence_length, num_hidden_dims).
-        dropout_rate: Dropout rate (0.0 to 1.0).
-    Returns:
-        Output tensor with dropout applied.
-    """
-    if dropout_rate <= 0.0:
-        return input_tensor
-    mask = np.random.binomial(1, 1 - dropout_rate, size=input_tensor.shape).astype(
-        input_tensor.dtype
-    )
-    return input_tensor * mask / (1 - dropout_rate)
-
-
 @profile
 def self_attention_block(
     input_tensor,
@@ -216,8 +199,7 @@ def full_block(
     sequence_length,
     heads,
     dims_per_head,
-    mask,
-    dropout_rate,
+    mask
 ):
     """Full transformer block with embedding, self-attention, MLP, and final logits.
     Args:
@@ -266,7 +248,6 @@ def full_block(
     )
 
     attention_projection = attention_output @ projection_weights + projection_bias
-    attention_projection = dropout(attention_projection, dropout_rate)
     input_residual = layer_normed_input_tensor + attention_projection
 
     second_layer_normed_input_tensor = layer_norm(
@@ -280,7 +261,6 @@ def full_block(
         mlp_weights2,
         mlp_bias2,
     )
-    mlp_output = dropout(mlp_output, dropout_rate)
 
     second_input_residual = input_residual + mlp_output
 
@@ -301,8 +281,6 @@ if __name__ == "__main__":
     dims_mlp = 4 * num_hidden_dims
 
     vocab_size = 50257  # typical GPT-style vocab
-
-    dropout_rate = 0.1  # typical dropout rate in transformers
 
     # The mean (0) and std dev (0.02) match the initialisation range in
     # standard transformer implementations (GPT, BERT, T5)
@@ -384,8 +362,7 @@ if __name__ == "__main__":
         sequence_length,
         heads,
         dims_per_head,
-        mask,
-        dropout_rate
+        mask
     )
 
     print("Tranformer pass completed")
