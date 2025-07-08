@@ -21,7 +21,7 @@ def embed_tokens(token_ids, token_embedding, positional_embedding):
 
 
 
-@njit(parallel=True)
+@njit(fastmath=True)
 def layer_norm(input_tensor, gamma, beta, eps=1e-5):
     batch_size, seq_len, hidden_dim = input_tensor.shape
     output = np.empty_like(input_tensor)
@@ -60,7 +60,7 @@ def relu(input_tensor):
 
 
 
-@njit(parallel=True)
+@njit(fastmath=True)
 def softmax_4d(input_tensor, max, axis=-1):
     """Softmax function.
     Args:
@@ -82,7 +82,7 @@ def softmax_4d(input_tensor, max, axis=-1):
     return output
 
 
-@njit(parallel=True)
+@njit(fastmath=True)
 def softmax_3d(input_tensor):
     """Softmax for (batch, seq, vocab) shaped tensor."""
     batch, seq, vocab = input_tensor.shape
@@ -129,24 +129,6 @@ def causal_mask(size):
         Causal mask of shape (size, size) with lower triangular part set to True.
     """
     return np.tril(np.ones((size, size), dtype=bool))
-
-
-def dropout(input_tensor, dropout_rate):
-    """Apply dropout to input tensor.
-    Args:
-        input_tensor: Input tensor of shape (batch_size, sequence_length, num_hidden_dims).
-        dropout_rate: Dropout rate (0.0 to 1.0).
-    Returns:
-        Output tensor with dropout applied.
-    """
-    if dropout_rate <= 0.0:
-        return input_tensor
-    mask = np.random.binomial(1, 1 - dropout_rate, size=input_tensor.shape).astype(
-        input_tensor.dtype
-    )
-    return input_tensor * mask / (1 - dropout_rate)
-
-
 
 def self_attention_block(
     input_tensor,
@@ -204,7 +186,7 @@ def self_attention_block(
 
 
 
-@njit(parallel=True)
+@njit(fastmath=True)
 def mlp_block(input_tensor, mlp_weights1, mlp_bias1, mlp_weights2, mlp_bias2):
     """Feedforward MLP block.
     Args:
@@ -243,7 +225,7 @@ def mlp_block(input_tensor, mlp_weights1, mlp_bias1, mlp_weights2, mlp_bias2):
 
 
 
-@njit(parallel=True)
+@njit(fastmath=True)
 def final_logits(output_tensor, head_weights, gamma_weights, beta_weights):
     batch_size, seq_len, hidden_dim = output_tensor.shape
     vocab_size = head_weights.shape[0]
@@ -289,8 +271,7 @@ def full_block(
     sequence_length,
     heads,
     dims_per_head,
-    mask,
-    dropout_rate,
+    mask
 ):
     """Full transformer block with embedding, self-attention, MLP, and final logits.
     Args:
@@ -320,12 +301,18 @@ def full_block(
     Returns:
         Output tensor after full transformer block.
     """
+
     embedded_tokens = embed_tokens(token_ids, token_embedding, positional_embedding)
 
+    start_layer_timer = time.time()
     layer_normed_input_tensor = layer_norm(
         embedded_tokens, gamma_weights1, beta_weights1
     )
+    stop_layer_timer = time.time()
 
+    print(f"Layer norm time: {stop_layer_timer - start_layer_timer:.6f} seconds")
+
+    start_attention_timer = time.time()
     attention_output = self_attention_block(
         layer_normed_input_tensor,
         query_weights,
@@ -337,15 +324,23 @@ def full_block(
         dims_per_head,
         mask,
     )
+    stop_attention_timer = time.time()
+    print(f"Self-attention time: {stop_attention_timer - start_attention_timer:.6f} seconds")
 
+    start_attention_projection_timer = time.time()
+    
     attention_projection = attention_output @ projection_weights + projection_bias
-    attention_projection = dropout(attention_projection, dropout_rate)
     input_residual = layer_normed_input_tensor + attention_projection
+
+    stop_attention_projection_timer = time.time()
+
+    print(f"Attention projection and residual time: {stop_attention_projection_timer - start_attention_projection_timer:.6f} seconds")
 
     second_layer_normed_input_tensor = layer_norm(
         input_residual, gamma_weights2, beta_weights2
     )
 
+    start_mlp_timer = time.time()
     mlp_output = mlp_block(
         second_layer_normed_input_tensor,
         mlp_weights1,
@@ -353,13 +348,17 @@ def full_block(
         mlp_weights2,
         mlp_bias2,
     )
-    mlp_output = dropout(mlp_output, dropout_rate)
+    stop_mlp_timer = time.time()
+    print(f"MLP block time: {stop_mlp_timer - start_mlp_timer} seconds")
 
     second_input_residual = input_residual + mlp_output
 
+    start_logits_timer = time.time()
     logits = final_logits(
         second_input_residual, token_embedding, gamma_weights3, beta_weights3
     )
+    stop_logits_timer = time.time()
+    print(f"Final logits computation time: {stop_logits_timer - start_logits_timer:.6} seconds")
 
     return softmax_3d(logits)
 
@@ -375,8 +374,6 @@ if __name__ == "__main__":
     dims_mlp = 4 * num_hidden_dims
 
     vocab_size = 50257  # typical GPT-style vocab
-
-    dropout_rate = 0.1  # typical dropout rate in transformers
 
     # The mean (0) and std dev (0.02) match the initialisation range in
     # standard transformer implementations (GPT, BERT, T5)
@@ -460,7 +457,6 @@ if __name__ == "__main__":
         heads,
         dims_per_head,
         mask,
-        dropout_rate
     )
     end = time.time()
     print(f"Execution time: {end - start:.6f} seconds")
