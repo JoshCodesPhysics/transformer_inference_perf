@@ -1,0 +1,7 @@
+
+# conda environments:
+#
+                       /Users/admin/miniconda3
+base                   /Users/admin/miniforge3
+my_new_env           * /Users/admin/miniforge3/envs/my_new_env
+
